@@ -4,7 +4,7 @@ const fetch = require("node-fetch");
 const app = express();
 
 // ========== CONFIGURACIÓN (variables de entorno en Railway) ==========
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 8080;
 const API_TOKEN = process.env.API_TOKEN;
 const API_BASE_URL = (process.env.API_BASE_URL ||
     "https://botai.smartdataautomation.com/api_backend_ai/dinamic-db/report/119").replace(/\/+$/, "");
@@ -23,16 +23,15 @@ const AUTH_HEADERS = {
 
 const COLECCIONES = {
     usuarios: `${API_BASE_URL}/usuarios_unilevel`,
-    pdv: `${API_BASE_URL}/pdv_unilevel`,
+    ingresosPdv: `${API_BASE_URL}/pdv_registro_unilevel`,
     productos: `${API_BASE_URL}/productos_unilevel`,
     registros: `${API_BASE_URL}/registro_inventario_unilevel`,
 };
 
-// ⚠️ PENDIENTE DE CONFIRMAR: usuarios_unilevel está vacía, nombres tomados del proyecto Nutresa
+// Campo de cédula en usuarios_unilevel y pdv_registro_unilevel
 const CAMPO_CEDULA = "CEDULA";
-// ⚠️ PENDIENTE: campo que relaciona al usuario con su punto de venta (pdv_unilevel no tiene cédula)
-const CAMPO_PDV_EN_USUARIO = null;   // ej. "SAP" si el usuario trae el código SAP del PDV
-const CAMPO_PDV_CLAVE = "SAP";       // campo de pdv_unilevel con el que se cruza
+// Zona horaria para decidir qué ingresos son "de hoy"
+const ZONA_HORARIA = "America/Bogota";
 
 const CANTIDAD_MAXIMA = 999999;
 const ESTADO_EN_PROCESO = "EN_PROCESO";
@@ -78,7 +77,11 @@ async function consultarColeccion(url) {
     return Array.isArray(data.result) ? data.result : [];
 }
 
-async function crearDocumento(url, doc) {
+// La API dinamic-db usa POST para todo:
+//  - sin _id  -> crea el documento y responde { status: "ok", insert_id: "..." }
+//  - con _id  -> actualiza ese documento; los campos deben llamarse EXACTAMENTE igual
+//                que en la base, si no se crea un registro nuevo
+async function enviarDocumento(url, doc) {
     const response = await fetch(url, {
         method: "POST",
         headers: AUTH_HEADERS,
@@ -92,10 +95,25 @@ async function crearDocumento(url, doc) {
     return response.json().catch(() => ({}));
 }
 
-// ⚠️ PENDIENTE: falta saber cómo la API dinamic-db actualiza un documento existente
-// (método, ruta y formato). No se inventa: se responde 501 hasta tenerlo confirmado.
-async function actualizarDocumento(url, id, doc) {
-    throw new ErrorApi(501, "La actualización de registros aún no está configurada en el servidor.");
+async function crearDocumento(url, doc) {
+    const { _id, ...sinId } = doc;
+    const data = await enviarDocumento(url, sinId);
+    return data && data.insert_id ? String(data.insert_id) : null;
+}
+
+async function actualizarDocumento(url, id, campos) {
+    const data = await enviarDocumento(url, { _id: String(id), ...campos });
+    if (data && data.insert_id && String(data.insert_id) !== String(id)) {
+        console.warn(`⚠️ Se esperaba actualizar ${id} pero la API creó ${data.insert_id}. Revisa los nombres de campos.`);
+    }
+}
+
+// "YYYY-MM-DD" en hora de Colombia. Los "created" de la base vienen en UTC sin zona.
+function diaLocal(fecha) {
+    const texto = String(fecha || "");
+    const d = new Date(/[zZ]|[+-]\d{2}:?\d{2}$/.test(texto) ? texto : `${texto}Z`);
+    if (Number.isNaN(d.getTime())) return null;
+    return new Intl.DateTimeFormat("en-CA", { timeZone: ZONA_HORARIA }).format(d);
 }
 
 // Serializa las operaciones sobre un mismo registro para no pisar cambios simultáneos
@@ -145,22 +163,35 @@ async function buscarUsuario(cedula) {
     ) || null;
 }
 
-async function buscarPuntoVenta(usuario) {
-    if (!CAMPO_PDV_EN_USUARIO) {
-        console.warn("⚠️ Sin relación usuario → punto de venta configurada; PUNTO_VENTA queda en null");
-        return null;
-    }
-    const valor = usuario[CAMPO_PDV_EN_USUARIO];
-    if (valor === undefined || valor === null) return null;
+// Día del ingreso: FECHA_REGISTRO ya viene en fecha local ("2026-10-07T00:00:00");
+// si no viene, se usa "created" (UTC) convertido a hora de Colombia
+function diaDeIngreso(ingreso) {
+    const fecha = String(ingreso.FECHA_REGISTRO || "");
+    return /^\d{4}-\d{2}-\d{2}/.test(fecha) ? fecha.slice(0, 10) : diaLocal(ingreso.created);
+}
 
-    const pdvs = await consultarColeccion(COLECCIONES.pdv);
-    const pdv = pdvs.find(p => String(p[CAMPO_PDV_CLAVE]).trim() === String(valor).trim());
-    if (!pdv) return null;
+// El chatbot registra en pdv_registro_unilevel a qué punto va la persona.
+// Se toma el ingreso MÁS RECIENTE de HOY para esa cédula.
+async function buscarIngresoDeHoy(cedula) {
+    const hoy = diaLocal(new Date().toISOString());
+    const ingresos = await consultarColeccion(COLECCIONES.ingresosPdv);
+    return ingresos
+        .filter(i =>
+            i[CAMPO_CEDULA] !== undefined && i[CAMPO_CEDULA] !== null &&
+            i[CAMPO_CEDULA].toString().trim() === cedula &&
+            diaDeIngreso(i) === hoy
+        )
+        .sort((a, b) => String(b.created).localeCompare(String(a.created)))[0] || null;
+}
 
+// pdv_registro_unilevel: { SAP, PDV, CIUDAD, CEDULA, NOMBRE, TELEFONO, FECHA_REGISTRO, created }
+function puntoVentaDesdeIngreso(ingreso) {
     return {
-        CODIGO: String(pdv.SAP),
-        NOMBRE: pdv.PDV,
-        CIUDAD: pdv.CIUDAD,
+        INGRESO_ID: String(ingreso._id),
+        CODIGO: ingreso.SAP !== undefined && ingreso.SAP !== null ? String(ingreso.SAP) : null,
+        NOMBRE: ingreso.PDV ?? null,
+        CIUDAD: ingreso.CIUDAD ?? null,
+        FECHA_INGRESO: ingreso.FECHA_REGISTRO || ingreso.created || null,
     };
 }
 
@@ -170,9 +201,13 @@ async function buscarRegistroPorId(id) {
     return registros.find(r => String(r._id) === String(id)) || null;
 }
 
-async function buscarRegistroPorCedula(cedula) {
+// Un registro de inventario por cada ingreso al punto de venta (cédula + ingreso del chatbot)
+async function buscarRegistroPorIngreso(cedula, ingresoId) {
     const registros = await consultarColeccion(COLECCIONES.registros);
-    return registros.find(r => r.USUARIO && String(r.USUARIO.CEDULA) === cedula) || null;
+    return registros.find(r =>
+        r.USUARIO && String(r.USUARIO.CEDULA) === cedula &&
+        r.PUNTO_VENTA && String(r.PUNTO_VENTA.INGRESO_ID) === ingresoId
+    ) || null;
 }
 
 async function obtenerRegistroOError(id) {
@@ -208,14 +243,21 @@ app.post("/api/registros", manejar(async (req, res) => {
     }
 
     const registro = await conBloqueo(`cedula:${cedula}`, async () => {
-        const existente = await buscarRegistroPorCedula(cedula);
+        const usuario = await buscarUsuario(cedula);
+        if (!usuario) throw new ErrorApi(404, "No encontramos tu cédula, verifícala e intenta de nuevo");
+
+        const ingreso = await buscarIngresoDeHoy(cedula);
+        if (!ingreso) {
+            throw new ErrorApi(404,
+                "No encontramos tu ingreso a un punto de venta hoy. Primero indica en el chatbot a qué punto vas.");
+        }
+        const ingresoId = String(ingreso._id);
+
+        const existente = await buscarRegistroPorIngreso(cedula, ingresoId);
         if (existente) {
             console.log(`♻️ Registro recuperado para ${cedula}: ${existente._id}`);
             return existente;
         }
-
-        const usuario = await buscarUsuario(cedula);
-        if (!usuario) throw new ErrorApi(404, "No encontramos tu cédula, verifícala e intenta de nuevo");
 
         const { _id, created, ...datosUsuario } = usuario;
         const fecha = ahora();
@@ -223,14 +265,14 @@ app.post("/api/registros", manejar(async (req, res) => {
             FECHA_REGISTRO: fecha,
             FECHA_ACTUALIZACION: fecha,
             USUARIO: { ...datosUsuario, CEDULA: cedula },
-            PUNTO_VENTA: await buscarPuntoVenta(usuario),
+            PUNTO_VENTA: puntoVentaDesdeIngreso(ingreso),
             MARCAS: [],
         };
 
-        await crearDocumento(COLECCIONES.registros, nuevo);
-
-        // No dependemos del formato de respuesta del POST: releemos para obtener el _id real
-        const creado = await buscarRegistroPorCedula(cedula);
+        const insertId = await crearDocumento(COLECCIONES.registros, nuevo);
+        const creado = insertId
+            ? { _id: insertId, ...nuevo }
+            : await buscarRegistroPorIngreso(cedula, ingresoId); // respaldo si no llega insert_id
         if (!creado) throw new ErrorApi(502, "No pudimos crear tu registro. Intenta de nuevo.");
         console.log(`🆕 Registro creado para ${cedula}: ${creado._id}`);
         return creado;
@@ -304,7 +346,10 @@ app.put("/api/registros/:id/producto", manejar(async (req, res) => {
         else marca.PRODUCTOS.push(item);
 
         reg.FECHA_ACTUALIZACION = fecha;
-        await actualizarDocumento(COLECCIONES.registros, id, reg);
+        await actualizarDocumento(COLECCIONES.registros, id, {
+            MARCAS: reg.MARCAS,
+            FECHA_ACTUALIZACION: fecha,
+        });
         return reg;
     });
 
@@ -342,7 +387,10 @@ app.post("/api/registros/:id/marcas/:marca/finalizar", manejar(async (req, res) 
         marca.ESTADO = ESTADO_FINALIZADA;
         marca.FECHA_FINALIZACION = fecha;
         reg.FECHA_ACTUALIZACION = fecha;
-        await actualizarDocumento(COLECCIONES.registros, id, reg);
+        await actualizarDocumento(COLECCIONES.registros, id, {
+            MARCAS: reg.MARCAS,
+            FECHA_ACTUALIZACION: fecha,
+        });
         return reg;
     });
 
