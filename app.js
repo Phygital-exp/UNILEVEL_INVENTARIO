@@ -3,7 +3,7 @@
 
     const CFG = window.APP_CONFIG;
     const $ = id => document.getElementById(id);
-    const CLAVE_SESION = "inventario_unilevel_sesion";
+    const CLAVE_SESION = "inventario_unilever_sesion";
     const MAX_FALTANTES_MODAL = 4;
     const MAX_DIGITOS = 6;
 
